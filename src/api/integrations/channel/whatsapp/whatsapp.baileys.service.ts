@@ -3424,7 +3424,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Outros países: código(1-3) + número(7-12) = geralmente 10-15 dígitos
     // Se tiver entre 10-14 dígitos e começar com dígito 1-9, provavelmente é telefone
-    if (cleanNumber.length >= 10 && cleanNumber.length <= 14) {
+    // EXCEÇÃO: Se tiver 14+ dígitos, provavelmente é LID (telefones raramente têm mais de 13)
+    if (cleanNumber.length >= 10 && cleanNumber.length <= 13) {
       // Verificar se começa com código de país plausível (1-9)
       const firstDigit = parseInt(cleanNumber[0]);
       if (firstDigit >= 1 && firstDigit <= 9) {
@@ -3434,7 +3435,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     // Se chegou aqui, provavelmente é LID:
-    // - Muito longo (15+ dígitos)
+    // - 14+ dígitos (telefones raramente têm mais de 13)
     // - Ou não segue padrão de número de telefone
     this.logger.verbose(`[LID-DETECT] Number ${cleanNumber} detected as likely LID (not a valid phone number format)`);
     return true;
@@ -3454,6 +3455,29 @@ export class BaileysStartupService extends ChannelStartupService {
     const cachedLids = numbersToCheck.length > 0 ? await getOnWhatsappCache(numbersToCheck) : [];
     this.logger.verbose(`[LID-DEBUG] Cached LIDs found: ${JSON.stringify(cachedLids)}`);
 
+    // Verificar também na tabela de contatos se algum número existe como @lid
+    const potentialLidNumbers = numbersToCheck.filter((n) => !cachedLids.some((c) => c.jidOptions.includes(n)));
+    const contactLidMap = new Map<string, string>();
+
+    if (potentialLidNumbers.length > 0) {
+      // Buscar contatos que tenham remoteJid terminando em @lid para esses números
+      const lidContacts = await this.prismaRepository.contact.findMany({
+        where: {
+          instanceId: this.instanceId,
+          remoteJid: {
+            in: potentialLidNumbers.map((n) => `${n.replace(/\D/g, '')}@lid`),
+          },
+        },
+        select: { remoteJid: true },
+      });
+
+      lidContacts.forEach((contact) => {
+        const num = contact.remoteJid.split('@')[0];
+        contactLidMap.set(num, contact.remoteJid);
+        this.logger.verbose(`[LID-DEBUG] Found LID in contacts table: ${num} -> ${contact.remoteJid}`);
+      });
+    }
+
     // Criar mapa de número -> LID
     const lidMap = new Map<string, string>();
     cachedLids.forEach((cached) => {
@@ -3470,6 +3494,13 @@ export class BaileysStartupService extends ChannelStartupService {
             this.logger.verbose(`[LID-DEBUG] Mapped ${num} -> ${lidJid}`);
           });
         }
+      }
+    });
+
+    // Adicionar LIDs encontrados na tabela de contatos
+    contactLidMap.forEach((lidJid, num) => {
+      if (!lidMap.has(num)) {
+        lidMap.set(num, lidJid);
       }
     });
 
