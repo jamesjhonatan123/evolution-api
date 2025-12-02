@@ -570,9 +570,10 @@ export class ChatwootService {
   }
 
   public async createConversation(instance: InstanceDto, body: any) {
-    const isLid = body.key.addressingMode === 'lid';
+    const isLid = body.key.addressingMode === 'lid' || body.key.remoteJid?.endsWith('@lid');
     const isGroup = body.key.remoteJid.endsWith('@g.us');
-    const phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : body.key.remoteJid;
+    // Se for LID e tiver remoteJidAlt, usa ele; senão usa remoteJid mesmo (fallback para LIDs sem número alternativo)
+    const phoneNumber = isLid && !isGroup && body.key.remoteJidAlt ? body.key.remoteJidAlt : body.key.remoteJid;
     const { remoteJid } = body.key;
     const cacheKey = `${instance.instanceName}:createConversation-${remoteJid}`;
     const lockKey = `${instance.instanceName}:lock:createConversation-${remoteJid}`;
@@ -2030,10 +2031,12 @@ export class ChatwootService {
 
           if (body.key.remoteJid.includes('@g.us')) {
             const participantName = body.pushName;
+            const isLidParticipant =
+              (body.key.addressingMode === 'lid' || body.key.participant?.endsWith('@lid')) && !body.key.fromMe;
             const rawPhoneNumber =
-              body.key.addressingMode === 'lid' && !body.key.fromMe
+              isLidParticipant && body.key.participantAlt
                 ? body.key.participantAlt.split('@')[0]
-                : body.key.participant.split('@')[0];
+                : body.key.participant?.split('@')[0] || '';
             const phoneMatch = rawPhoneNumber.match(/^(\d{2})(\d{2})(\d{4})(\d{4})$/);
 
             let formattedPhoneNumber: string;
@@ -2176,10 +2179,12 @@ export class ChatwootService {
 
         if (body.key.remoteJid.includes('@g.us')) {
           const participantName = body.pushName;
+          const isLidParticipant =
+            (body.key.addressingMode === 'lid' || body.key.participant?.endsWith('@lid')) && !body.key.fromMe;
           const rawPhoneNumber =
-            body.key.addressingMode === 'lid' && !body.key.fromMe
+            isLidParticipant && body.key.participantAlt
               ? body.key.participantAlt.split('@')[0]
-              : body.key.participant.split('@')[0];
+              : body.key.participant?.split('@')[0] || '';
           const phoneMatch = rawPhoneNumber.match(/^(\d{2})(\d{2})(\d{4})(\d{4})$/);
 
           let formattedPhoneNumber: string;

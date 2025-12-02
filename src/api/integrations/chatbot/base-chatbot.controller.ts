@@ -788,6 +788,10 @@ export abstract class BaseChatbotController<BotType = any, BotData extends BaseC
   public async emit({ instance, remoteJid, msg }: EmitData) {
     if (!this.integrationEnabled) return;
 
+    this.logger.debug(
+      `[CHATBOT-DEBUG] ${this.integrationName} emit called - remoteJid: ${remoteJid}, instance: ${instance.instanceName}`,
+    );
+
     try {
       const settings = await this.settingsRepository.findFirst({
         where: {
@@ -795,20 +799,29 @@ export abstract class BaseChatbotController<BotType = any, BotData extends BaseC
         },
       });
 
-      if (this.checkIgnoreJids(settings?.ignoreJids, remoteJid)) return;
+      this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} settings found: ${settings ? 'yes' : 'no'}`);
+
+      if (this.checkIgnoreJids(settings?.ignoreJids, remoteJid)) {
+        this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} remoteJid ignored: ${remoteJid}`);
+        return;
+      }
 
       const session = await this.getSession(remoteJid, instance);
+      this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} session: ${session ? session.id : 'none'}`);
 
       const content = getConversationMessage(msg);
+      this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} content: ${content?.substring(0, 50)}`);
 
       // Get integration type
       // const integrationType = this.getIntegrationType();
 
       // Find a bot for this message
       let findBot: any = await this.findBotTrigger(this.botRepository, content, instance, session);
+      this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} findBot: ${findBot ? findBot.id : 'none'}`);
 
       // If no bot is found, try to use fallback
       if (!findBot) {
+        this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} no bot found by trigger, trying fallback`);
         const fallback = await this.settingsRepository.findFirst({
           where: {
             instanceId: instance.instanceId,
@@ -817,6 +830,7 @@ export abstract class BaseChatbotController<BotType = any, BotData extends BaseC
 
         // Get the fallback ID for this integration type
         const fallbackId = this.getFallbackBotId(fallback);
+        this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} fallbackId: ${fallbackId || 'none'}`);
 
         if (fallbackId) {
           const findFallback = await this.botRepository.findFirst({
@@ -826,13 +840,16 @@ export abstract class BaseChatbotController<BotType = any, BotData extends BaseC
           });
 
           findBot = findFallback;
+          this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} fallback bot: ${findBot ? findBot.id : 'none'}`);
         } else {
+          this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} no fallback configured, returning`);
           return;
         }
       }
 
       // If we still don't have a bot, return
       if (!findBot) {
+        this.logger.debug(`[CHATBOT-DEBUG] ${this.integrationName} no bot found at all, returning`);
         return;
       }
 

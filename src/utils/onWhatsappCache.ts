@@ -14,6 +14,11 @@ function getAvailableNumbers(remoteJid: string) {
 
   const [number, domain] = remoteJid.split('@');
 
+  // Se não tem domínio, retorna apenas o número (para busca por contains)
+  if (!domain) {
+    return [number];
+  }
+
   // TODO: Se já for @lid, retornar apenas ele mesmo SEM adicionar @domain novamente
   if (domain === 'lid' || domain === 'g.us') {
     return [remoteJid]; // Retorna direto para @lid e @g.us
@@ -70,18 +75,16 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
     for (const item of data) {
       const remoteJid = item.remoteJid.startsWith('+') ? item.remoteJid.slice(1) : item.remoteJid;
 
-      // TODO: Buscar registro existente PRIMEIRO para preservar dados
+      // Coletar todos os JIDs relacionados (LID + número normal)
       const allJids = [remoteJid];
 
-      const altJid =
-        item.remoteJidAlt && item.remoteJidAlt.includes('@lid')
-          ? item.remoteJidAlt.startsWith('+')
-            ? item.remoteJidAlt.slice(1)
-            : item.remoteJidAlt
-          : null;
-
-      if (altJid) {
-        allJids.push(altJid);
+      // Se tiver remoteJidAlt (pode ser @s.whatsapp.net para LIDs ou @lid para normais)
+      // Adicionar aos JIDs para busca cruzada
+      if (item.remoteJidAlt) {
+        const altJid = item.remoteJidAlt.startsWith('+') ? item.remoteJidAlt.slice(1) : item.remoteJidAlt;
+        if (!allJids.includes(altJid)) {
+          allJids.push(altJid);
+        }
       }
 
       const expandedJids = allJids.flatMap((jid) => getAvailableNumbers(jid));
@@ -98,17 +101,12 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
 
       if (existingRecord?.jidOptions) {
         const existingJids = existingRecord.jidOptions.split(',');
-        // TODO: Adicionar JIDs existentes que não estão na lista atual
+        // Adicionar JIDs existentes que não estão na lista atual
         existingJids.forEach((jid) => {
           if (!finalJidOptions.includes(jid)) {
             finalJidOptions.push(jid);
           }
         });
-      }
-
-      // TODO: Se tiver remoteJidAlt com @lid novo, adicionar
-      if (altJid && !finalJidOptions.includes(altJid)) {
-        finalJidOptions.push(altJid);
       }
 
       const uniqueNumbers = Array.from(new Set(finalJidOptions));

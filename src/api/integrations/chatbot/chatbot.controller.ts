@@ -84,6 +84,10 @@ export class ChatbotController {
     pushName?: string;
     isIntegration?: boolean;
   }): Promise<void> {
+    this.logger.debug(
+      `[CHATBOT-DISPATCH] emit called - remoteJid: ${remoteJid}, instance: ${instance.instanceName}, isLid: ${remoteJid?.endsWith('@lid')}`,
+    );
+
     const emitData = {
       instance,
       remoteJid,

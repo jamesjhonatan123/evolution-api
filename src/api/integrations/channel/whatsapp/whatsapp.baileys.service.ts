@@ -82,7 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
-import {makeProxyAgent, makeProxyAgentUndici} from '@utils/makeProxyAgent';
+import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -157,6 +157,7 @@ export interface ExtendedIMessageKey extends proto.IMessageKey {
   participantAlt?: string;
   server_id?: string;
   isViewOnce?: boolean;
+  addressingMode?: string;
 }
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
@@ -1022,7 +1023,7 @@ export class BaileysStartupService extends ChannelStartupService {
           messagesRaw.push(this.prepareMessage(m));
         }
 
-        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw]);
+        this.emitMessageWebhook(Events.MESSAGES_SET, [...messagesRaw]);
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
@@ -1102,7 +1103,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 editedMessage,
               );
 
-            await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
+            await this.emitMessageWebhook(Events.MESSAGES_EDITED, editedMessage);
             const oldMessage = await this.getMessage(editedMessage.key, true);
             if ((oldMessage as any)?.id) {
               const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
@@ -1350,11 +1351,33 @@ export class BaileysStartupService extends ChannelStartupService {
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
 
-          this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+          this.emitMessageWebhook(Events.MESSAGES_UPSERT, messageRaw);
+
+          let chatbotRemoteJid = this.getNormalizedRemoteJid(messageRaw.key) ?? messageRaw.key.remoteJid;
+
+          // Se o chatbotRemoteJid ainda é um LID (sem remoteJidAlt), tenta buscar o número normal do cache
+          if (chatbotRemoteJid?.endsWith('@lid')) {
+            const lidNumber = chatbotRemoteJid.replace('@lid', '');
+            const cachedEntry = await getOnWhatsappCache([lidNumber]);
+            if (cachedEntry.length > 0) {
+              // Busca um JID @s.whatsapp.net nos jidOptions
+              const normalJid = cachedEntry[0].jidOptions.find((jid) => jid.endsWith('@s.whatsapp.net'));
+              if (normalJid) {
+                this.logger.debug(
+                  `[CHATBOT-TRIGGER] Found cached normal JID for LID ${chatbotRemoteJid}: ${normalJid}`,
+                );
+                chatbotRemoteJid = normalJid;
+              }
+            }
+          }
+
+          this.logger.debug(
+            `[CHATBOT-TRIGGER] key.remoteJid: ${messageRaw.key.remoteJid}, key.remoteJidAlt: ${messageRaw.key.remoteJidAlt}, isLid: ${this.isLidKey(messageRaw.key)}, chatbotRemoteJid: ${chatbotRemoteJid}`,
+          );
 
           await chatbotController.emit({
             instance: { instanceName: this.instance.name, instanceId: this.instanceId },
-            remoteJid: messageRaw.key.remoteJid,
+            remoteJid: chatbotRemoteJid,
             msg: messageRaw,
             pushName: messageRaw.pushName,
           });
@@ -1380,12 +1403,19 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (contactRaw.remoteJid.includes('@s.whatsapp') || contactRaw.remoteJid.includes('@lid')) {
+            const isLid = messageRaw.key.addressingMode === 'lid' || messageRaw.key.remoteJid?.endsWith('@lid');
+
+            // Para LID: salvar o LID como remoteJid principal (é o que usamos para enviar)
+            // O remoteJidAlt (número normal) será adicionado aos jidOptions para busca
+            // Para não-LID: usar o remoteJid normal
+            const remoteJidToSave = isLid ? messageRaw.key.remoteJid : messageRaw.key.remoteJid;
+
             await saveOnWhatsappCache([
               {
-                remoteJid:
-                  messageRaw.key.addressingMode === 'lid' ? messageRaw.key.remoteJidAlt : messageRaw.key.remoteJid,
-                remoteJidAlt: messageRaw.key.remoteJidAlt,
-                lid: messageRaw.key.addressingMode === 'lid' ? 'lid' : null,
+                remoteJid: remoteJidToSave,
+                // remoteJidAlt contém o número normal @s.whatsapp.net (para LIDs)
+                remoteJidAlt: isLid ? messageRaw.key.remoteJidAlt : undefined,
+                lid: isLid ? 'lid' : null,
               },
             ]);
           }
@@ -1459,6 +1489,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         if (key.remoteJid !== 'status@broadcast' && key.id !== undefined) {
+          const extendedKey = key as ExtendedIMessageKey;
           let pollUpdates: any;
 
           if (update.pollUpdates) {
@@ -1502,7 +1533,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (update.message === null && update.status === undefined) {
-            this.sendDataWebhook(Events.MESSAGES_DELETE, key);
+            this.emitMessageWebhook(Events.MESSAGES_DELETE, key);
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
               await this.prismaRepository.messageUpdate.create({ data: message });
@@ -1548,7 +1579,18 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
+          const messageWebhookPayload =
+            extendedKey.addressingMode === 'lid' || extendedKey.remoteJid?.endsWith('@lid')
+              ? {
+                  ...message,
+                  originalRemoteJid: extendedKey.remoteJid,
+                  originalParticipant: extendedKey.participant,
+                  remoteJid: this.getNormalizedRemoteJid(extendedKey) ?? extendedKey.remoteJid,
+                  participant: this.getNormalizedParticipant(extendedKey) ?? extendedKey.participant,
+                }
+              : message;
+
+          this.emitMessageWebhook(Events.MESSAGES_UPDATE, messageWebhookPayload);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
             await this.prismaRepository.messageUpdate.create({ data: message });
@@ -2377,12 +2419,26 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.logger.verbose(messageSent);
 
-      this.sendDataWebhook(Events.SEND_MESSAGE, messageRaw);
+      this.emitMessageWebhook(Events.SEND_MESSAGE, messageRaw);
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled && isIntegration) {
+        let chatbotRemoteJid = this.getNormalizedRemoteJid(messageRaw.key) ?? messageRaw.key.remoteJid;
+
+        // Se o chatbotRemoteJid ainda é um LID (sem remoteJidAlt), tenta buscar o número normal do cache
+        if (chatbotRemoteJid?.endsWith('@lid')) {
+          const lidNumber = chatbotRemoteJid.replace('@lid', '');
+          const cachedEntry = await getOnWhatsappCache([lidNumber]);
+          if (cachedEntry.length > 0) {
+            const normalJid = cachedEntry[0].jidOptions.find((jid) => jid.endsWith('@s.whatsapp.net'));
+            if (normalJid) {
+              chatbotRemoteJid = normalJid;
+            }
+          }
+        }
+
         await chatbotController.emit({
           instance: { instanceName: this.instance.name, instanceId: this.instanceId },
-          remoteJid: messageRaw.key.remoteJid,
+          remoteJid: chatbotRemoteJid,
           msg: messageRaw,
           pushName: messageRaw.pushName,
           isIntegration,
@@ -3346,7 +3402,48 @@ export class BaileysStartupService extends ChannelStartupService {
       users: { number: string; jid: string; name?: string }[];
     } = { groups: [], broadcast: [], users: [] };
 
+    // Primeiro, verificar se algum número tem LID associado no cache
+    const numbersToCheck = data.numbers.filter((n) => !n.includes('@'));
+    this.logger.verbose(`[LID-DEBUG] Numbers to check for LID: ${JSON.stringify(numbersToCheck)}`);
+    const cachedLids = numbersToCheck.length > 0 ? await getOnWhatsappCache(numbersToCheck) : [];
+    this.logger.verbose(`[LID-DEBUG] Cached LIDs found: ${JSON.stringify(cachedLids)}`);
+
+    // Criar mapa de número -> LID
+    const lidMap = new Map<string, string>();
+    cachedLids.forEach((cached) => {
+      this.logger.verbose(`[LID-DEBUG] Processing cached entry: ${JSON.stringify(cached)}`);
+      if (cached.lid === 'lid') {
+        // Encontrar o JID com @lid nas opções
+        const lidJid = cached.jidOptions.find((jid) => jid.includes('@lid'));
+        this.logger.verbose(`[LID-DEBUG] Found lidJid: ${lidJid}`);
+        if (lidJid) {
+          // Mapear todos os números associados para este LID
+          cached.jidOptions.forEach((jid) => {
+            const num = jid.split('@')[0];
+            lidMap.set(num, lidJid);
+            this.logger.verbose(`[LID-DEBUG] Mapped ${num} -> ${lidJid}`);
+          });
+        }
+      }
+    });
+
     data.numbers.forEach((number) => {
+      // Se já tem @lid, usar direto
+      if (number.includes('@lid')) {
+        jids.users.push({ number, jid: number });
+        return;
+      }
+
+      // Verificar se tem LID associado no cache
+      const cleanNumber = number.replace(/\D/g, '');
+      const lidJid = lidMap.get(cleanNumber);
+
+      if (lidJid) {
+        this.logger.verbose(`Found LID in cache for ${number}: ${lidJid}`);
+        jids.users.push({ number, jid: lidJid });
+        return;
+      }
+
       const jid = createJid(number);
 
       if (isJidGroup(jid)) {
@@ -3407,12 +3504,24 @@ export class BaileysStartupService extends ChannelStartupService {
         const cached = cachedNumbers.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
 
         if (cached) {
-          this.logger.verbose(`Number ${user.number} found in cache`);
+          this.logger.verbose(`Number ${user.number} found in cache, lid=${cached.lid}`);
+
+          // IMPORTANTE: Se for LID, devemos usar o JID @lid para envio, não @s.whatsapp.net
+          // Contas com LID addressing mode só recebem mensagens via @lid
+          let jidToUse = cached.remoteJid;
+          if (cached.lid === 'lid') {
+            const lidJid = cached.jidOptions.find((jid) => jid.includes('@lid'));
+            if (lidJid) {
+              this.logger.verbose(`[LID-SEND] Using LID JID for sending: ${lidJid} instead of ${cached.remoteJid}`);
+              jidToUse = lidJid;
+            }
+          }
+
           return new OnWhatsAppDto(
-            cached.remoteJid,
+            jidToUse,
             true,
             user.number,
-            contacts.find((c) => c.remoteJid === cached.remoteJid)?.pushName,
+            contacts.find((c) => c.remoteJid === cached.remoteJid || c.remoteJid === jidToUse)?.pushName,
             cached.lid || (cached.remoteJid.includes('@lid') ? 'lid' : undefined),
           );
         }
@@ -3636,7 +3745,7 @@ export class BaileysStartupService extends ChannelStartupService {
             if (!message) return response;
             await this.prismaRepository.message.deleteMany({ where: { id: message.id } });
           }
-          this.sendDataWebhook(Events.MESSAGES_DELETE, {
+          this.emitMessageWebhook(Events.MESSAGES_DELETE, {
             id: message.id,
             instanceId: message.instanceId,
             key: message.key,
@@ -4019,7 +4128,7 @@ export class BaileysStartupService extends ChannelStartupService {
           messageSent?.message?.protocolMessage || messageSent?.message?.editedMessage?.message?.protocolMessage;
 
         if (editedMessage) {
-          this.sendDataWebhook(Events.SEND_MESSAGE_UPDATE, editedMessage);
+          this.emitMessageWebhook(Events.SEND_MESSAGE_UPDATE, editedMessage);
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
             this.chatwootService.eventWhatsapp(
               'send.message.update',
@@ -4534,7 +4643,110 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     }
 
-    return messageRaw;
+    return this.normalizeMessagePayloadForWebhook(messageRaw);
+  }
+
+  private isLidKey(key?: ExtendedIMessageKey): boolean {
+    if (!key) {
+      return false;
+    }
+    // Detecta LID por addressingMode OU por sufixo @lid no remoteJid
+    return key.addressingMode === 'lid' || key.remoteJid?.endsWith('@lid');
+  }
+
+  private getNormalizedRemoteJid(key?: ExtendedIMessageKey): string | undefined {
+    if (!key) {
+      return undefined;
+    }
+
+    return this.isLidKey(key) ? (key.remoteJidAlt ?? key.remoteJid) : key.remoteJid;
+  }
+
+  private getNormalizedParticipant(key?: ExtendedIMessageKey): string | undefined {
+    if (!key) {
+      return undefined;
+    }
+
+    return this.isLidKey(key) ? (key.participantAlt ?? key.participant) : key.participant;
+  }
+
+  private createWebhookKeyPayload(key?: ExtendedIMessageKey) {
+    if (!key) {
+      return key;
+    }
+
+    const alreadyNormalized = (key as any).originalRemoteJid !== undefined;
+    if (!this.isLidKey(key) || alreadyNormalized) {
+      return { ...key };
+    }
+
+    const normalizedRemoteJid = this.getNormalizedRemoteJid(key);
+    const normalizedParticipant = this.getNormalizedParticipant(key);
+
+    return {
+      ...key,
+      originalRemoteJid: key.remoteJid,
+      originalParticipant: key.participant,
+      remoteJid: normalizedRemoteJid,
+      participant: normalizedParticipant ?? key.participant,
+    };
+  }
+
+  private isExtendedMessageKey(value: any): value is ExtendedIMessageKey {
+    return (
+      value &&
+      typeof value === 'object' &&
+      typeof value.id === 'string' &&
+      (typeof value.remoteJid === 'string' || typeof value.remoteJidAlt === 'string') &&
+      !('key' in value) &&
+      !('keyId' in value)
+    );
+  }
+
+  private normalizeMessagePayloadForWebhook<T>(payload: T): T {
+    if (payload == null) {
+      return payload;
+    }
+
+    if (Array.isArray(payload)) {
+      return payload.map((item) => this.normalizeMessagePayloadForWebhook(item)) as unknown as T;
+    }
+
+    if (typeof payload !== 'object') {
+      return payload;
+    }
+
+    if (this.isExtendedMessageKey(payload)) {
+      return this.createWebhookKeyPayload(payload) as unknown as T;
+    }
+
+    const typedPayload = payload as Record<string, any>;
+
+    if (typedPayload.key) {
+      const normalizedKey = this.createWebhookKeyPayload(typedPayload.key);
+      if (normalizedKey !== typedPayload.key) {
+        const clone: Record<string, any> = { ...typedPayload, key: normalizedKey };
+
+        if (clone.message?.contextInfo) {
+          clone.message = {
+            ...clone.message,
+            contextInfo: {
+              ...clone.message.contextInfo,
+              participant: normalizedKey.participant ?? clone.message.contextInfo.participant,
+              remoteJid: normalizedKey.remoteJid ?? clone.message.contextInfo.remoteJid,
+            },
+          };
+        }
+
+        return clone as unknown as T;
+      }
+    }
+
+    return payload;
+  }
+
+  private emitMessageWebhook<T extends object>(event: Events, data: T, local = true, integration?: string[]) {
+    return this.sendDataWebhook(event, this.normalizeMessagePayloadForWebhook(data), local, integration);
   }
 
   private async syncChatwootLostMessages() {
